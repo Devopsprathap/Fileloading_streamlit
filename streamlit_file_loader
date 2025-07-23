@@ -16,13 +16,14 @@ def map_dtype(dtype):
         return "STRING"
 
 st.set_page_config(page_title="Upload to Snowflake", layout="centered")
-st.title("📂 Upload CSV/Excel to Snowflake")
+st.title("📂 Upload CSV/Excel/TXT to Snowflake")
 
 try:
     session = snowpark.Session.builder.getOrCreate()
     current_user = session.sql("SELECT CURRENT_USER()").collect()[0][0]
     st.success(f"✅ Connected as `{current_user}`")
 
+    # === Step 1: Select/Create Database ===
     db_rows = session.sql("SHOW DATABASES").collect()
     db_names = [row['name'] for row in db_rows]
     selected_db = st.selectbox("Select Existing Database", db_names)
@@ -33,6 +34,7 @@ try:
         selected_db = new_db
         st.success(f"✅ Using Database: `{selected_db}`")
 
+    # === Step 2: Select/Create Schema ===
     schema_rows = session.sql(f"SHOW SCHEMAS IN DATABASE {selected_db}").collect()
     schema_names = [row['name'] for row in schema_rows]
     selected_schema = st.selectbox(f"Select Existing Schema in `{selected_db}`", schema_names)
@@ -43,6 +45,7 @@ try:
         selected_schema = new_schema
         st.success(f"✅ Using Schema: `{selected_schema}`")
 
+    # === Step 3: Select/Create Table ===
     table_rows = session.sql(f"SHOW TABLES IN SCHEMA {selected_db}.{selected_schema}").collect()
     table_names = [row['name'] for row in table_rows]
     selected_existing_table = st.selectbox(f"Select Existing Table in `{selected_schema}`", [""] + table_names)
@@ -54,7 +57,8 @@ try:
         st.warning("⚠️ Please enter or select a table name.")
         st.stop()
 
-    uploaded_file = st.file_uploader("📤 Upload CSV or Excel File", type=["csv", "xlsx"])
+    # === Step 4: File Upload ===
+    uploaded_file = st.file_uploader("📤 Upload CSV, Excel, or Plain Text File", type=["csv", "xlsx", "txt"])
 
     delimiter_map = {
         "Comma (,)": ",",
@@ -63,13 +67,17 @@ try:
         "Pipe (|)": "|"
     }
 
-    delimiter_option = st.selectbox("Select CSV Delimiter", list(delimiter_map.keys()) + ["Custom"])
+    delimiter_option = st.selectbox("Select Delimiter (for CSV/TXT files)", list(delimiter_map.keys()) + ["Custom"])
     custom_delim = st.text_input("Enter Custom Delimiter", "") if delimiter_option == "Custom" else None
     delimiter = custom_delim if delimiter_option == "Custom" else delimiter_map.get(delimiter_option, ",")
 
     if uploaded_file:
-        if uploaded_file.name.endswith(".csv"):
-            df = pd.read_csv(uploaded_file, delimiter=delimiter)
+        if uploaded_file.name.endswith(".csv") or uploaded_file.name.endswith(".txt"):
+            try:
+                df = pd.read_csv(uploaded_file, delimiter=delimiter)
+            except Exception as e:
+                st.error(f"❌ Failed to parse file: {e}")
+                st.stop()
         else:
             df = pd.read_excel(uploaded_file)
 
@@ -109,12 +117,14 @@ try:
                     session.sql(f"DELETE FROM {full_table}").collect()
                     st.info("🧹 All rows deleted.")
                 elif operation == "Upsert":
-                    # Write to temporary staging table
+                    # Write to staging table
                     temp_table = f"{table_name}_STAGE_{uuid.uuid4().hex[:6].upper()}"
                     session.write_pandas(df, temp_table, schema=selected_schema, database=selected_db, overwrite=True)
                     staging_table = f'"{selected_db}"."{selected_schema}"."{temp_table}"'
+
                     set_clause = ", ".join([f'TARGET."{col}" = SOURCE."{col}"' for col in df.columns if col not in key_columns])
                     join_cond = " AND ".join([f'TARGET."{col}" = SOURCE."{col}"' for col in key_columns])
+
                     merge_sql = f"""
                         MERGE INTO {full_table} AS TARGET
                         USING {staging_table} AS SOURCE
@@ -123,6 +133,7 @@ try:
                         WHEN NOT MATCHED THEN INSERT ({", ".join([f'"{col}"' for col in df.columns])})
                         VALUES ({", ".join([f'SOURCE."{col}"' for col in df.columns])})
                     """
+
                     session.sql(merge_sql).collect()
                     session.sql(f'DROP TABLE IF EXISTS {staging_table}').collect()
                     st.success(f"🔁 Upsert completed into `{full_table}`")
