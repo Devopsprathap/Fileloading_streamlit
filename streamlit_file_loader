@@ -1,0 +1,142 @@
+import streamlit as st
+import pandas as pd
+import snowflake.snowpark as snowpark
+from snowflake.snowpark import Session
+import uuid
+
+# Helper to map pandas dtype to Snowflake SQL type
+def map_dtype(dtype):
+    if pd.api.types.is_integer_dtype(dtype):
+        return "NUMBER"
+    elif pd.api.types.is_float_dtype(dtype):
+        return "FLOAT"
+    elif pd.api.types.is_datetime64_any_dtype(dtype):
+        return "TIMESTAMP"
+    else:
+        return "STRING"
+
+st.set_page_config(page_title="Upload to Snowflake", layout="centered")
+st.title("📂 Upload CSV/Excel to Snowflake")
+
+try:
+    session = snowpark.Session.builder.getOrCreate()
+    current_user = session.sql("SELECT CURRENT_USER()").collect()[0][0]
+    st.success(f"✅ Connected as `{current_user}`")
+
+    db_rows = session.sql("SHOW DATABASES").collect()
+    db_names = [row['name'] for row in db_rows]
+    selected_db = st.selectbox("Select Existing Database", db_names)
+
+    new_db = st.text_input("Or Enter New Database Name (optional)").strip().upper()
+    if new_db:
+        session.sql(f"CREATE DATABASE IF NOT EXISTS {new_db}").collect()
+        selected_db = new_db
+        st.success(f"✅ Using Database: `{selected_db}`")
+
+    schema_rows = session.sql(f"SHOW SCHEMAS IN DATABASE {selected_db}").collect()
+    schema_names = [row['name'] for row in schema_rows]
+    selected_schema = st.selectbox(f"Select Existing Schema in `{selected_db}`", schema_names)
+
+    new_schema = st.text_input("Or Enter New Schema Name (optional)").strip().upper()
+    if new_schema:
+        session.sql(f"CREATE SCHEMA IF NOT EXISTS {selected_db}.{new_schema}").collect()
+        selected_schema = new_schema
+        st.success(f"✅ Using Schema: `{selected_schema}`")
+
+    table_rows = session.sql(f"SHOW TABLES IN SCHEMA {selected_db}.{selected_schema}").collect()
+    table_names = [row['name'] for row in table_rows]
+    selected_existing_table = st.selectbox(f"Select Existing Table in `{selected_schema}`", [""] + table_names)
+    new_table = st.text_input("Or Enter New Table Name (optional)").strip().upper()
+    table_name = new_table if new_table else selected_existing_table
+    full_table = f'"{selected_db}"."{selected_schema}"."{table_name}"'
+
+    if not table_name:
+        st.warning("⚠️ Please enter or select a table name.")
+        st.stop()
+
+    uploaded_file = st.file_uploader("📤 Upload CSV or Excel File", type=["csv", "xlsx"])
+
+    delimiter_map = {
+        "Comma (,)": ",",
+        "Semicolon (;)": ";",
+        "Tab (\\t)": "\t",
+        "Pipe (|)": "|"
+    }
+
+    delimiter_option = st.selectbox("Select CSV Delimiter", list(delimiter_map.keys()) + ["Custom"])
+    custom_delim = st.text_input("Enter Custom Delimiter", "") if delimiter_option == "Custom" else None
+    delimiter = custom_delim if delimiter_option == "Custom" else delimiter_map.get(delimiter_option, ",")
+
+    if uploaded_file:
+        if uploaded_file.name.endswith(".csv"):
+            df = pd.read_csv(uploaded_file, delimiter=delimiter)
+        else:
+            df = pd.read_excel(uploaded_file)
+
+        st.dataframe(df.head())
+
+        table_exists = table_name in table_names
+
+        if table_exists:
+            operation = st.radio(
+                "Table already exists. What operation should be performed?",
+                ["Append", "Truncate and Insert", "Delete All and Insert", "Upsert", "Cancel"],
+                index=0
+            )
+            if operation == "Cancel":
+                st.stop()
+
+            key_columns = []
+            if operation == "Upsert":
+                key_columns = st.multiselect("Select Key Columns for Upsert", df.columns.tolist())
+                if not key_columns:
+                    st.warning("⚠️ Please select at least one key column for upsert.")
+                    st.stop()
+        else:
+            operation = "Create and Insert"
+
+        if st.button("🚀 Upload to Snowflake"):
+            if not table_exists:
+                col_defs = ", ".join([f'"{col}" {map_dtype(df[col])}' for col in df.columns])
+                session.sql(f'CREATE TABLE {full_table} ({col_defs})').collect()
+                st.success(f"✅ Created table `{full_table}`")
+
+            else:
+                if operation == "Truncate and Insert":
+                    session.sql(f"TRUNCATE TABLE {full_table}").collect()
+                    st.info("🧹 Table truncated.")
+                elif operation == "Delete All and Insert":
+                    session.sql(f"DELETE FROM {full_table}").collect()
+                    st.info("🧹 All rows deleted.")
+                elif operation == "Upsert":
+                    # Write to temporary staging table
+                    temp_table = f"{table_name}_STAGE_{uuid.uuid4().hex[:6].upper()}"
+                    session.write_pandas(df, temp_table, schema=selected_schema, database=selected_db, overwrite=True)
+                    staging_table = f'"{selected_db}"."{selected_schema}"."{temp_table}"'
+                    set_clause = ", ".join([f'TARGET."{col}" = SOURCE."{col}"' for col in df.columns if col not in key_columns])
+                    join_cond = " AND ".join([f'TARGET."{col}" = SOURCE."{col}"' for col in key_columns])
+                    merge_sql = f"""
+                        MERGE INTO {full_table} AS TARGET
+                        USING {staging_table} AS SOURCE
+                        ON {join_cond}
+                        WHEN MATCHED THEN UPDATE SET {set_clause}
+                        WHEN NOT MATCHED THEN INSERT ({", ".join([f'"{col}"' for col in df.columns])})
+                        VALUES ({", ".join([f'SOURCE."{col}"' for col in df.columns])})
+                    """
+                    session.sql(merge_sql).collect()
+                    session.sql(f'DROP TABLE IF EXISTS {staging_table}').collect()
+                    st.success(f"🔁 Upsert completed into `{full_table}`")
+                    st.stop()
+
+            if operation != "Upsert":
+                session.write_pandas(
+                    df,
+                    table_name=table_name,
+                    database=selected_db,
+                    schema=selected_schema,
+                    overwrite=False
+                )
+                st.success(f"✅ Data uploaded to `{selected_db}`.`{selected_schema}`.`{table_name}`")
+
+except Exception as e:
+    st.error(f"❌ Error: {e}")
